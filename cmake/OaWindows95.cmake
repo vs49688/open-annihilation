@@ -30,7 +30,11 @@ if(OA_WINDOWS_95)
   # the 4.00 declarations leave out that the C++ run-time library needs — the
   # condition variable of the Windows API — cmake/toolchains/windows-95-gthr.hpp
   # declares and oa-platform-xp-runtime defines over the calls 95 does have.
-  target_compile_definitions(oa-options INTERFACE _WIN32_WINDOWS=0x0400 _WIN32_WINNT=0x0400 WINVER=0x0400)
+  # OA_WINDOWS_95 is defined as well, for a source that must choose between
+  # what 95 has and what a later Windows has, such as Winsock 1.1 and 2.
+  target_compile_definitions(
+    oa-options INTERFACE _WIN32_WINDOWS=0x0400 _WIN32_WINNT=0x0400 WINVER=0x0400 OA_WINDOWS_95=1
+  )
   # Windows 95 refuses to load a program whose subsystem or system version is
   # newer than it is, so both are stamped 4.0: the subsystem version the
   # loader checks, and the minimum operating system the image names.

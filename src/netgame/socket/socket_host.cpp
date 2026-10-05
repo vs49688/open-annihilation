@@ -10,8 +10,15 @@
 #include <cstring>
 
 #ifdef _WIN32
+#if defined(OA_WINDOWS_95)
+// Windows 95 ships Winsock 1.1, and its headers: Winsock 2's names sockets,
+// interfaces and name resolution differently and arrived with an update to
+// 95 and with Windows 98.
+#include <winsock.h>
+#else
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#endif
 using socket_len = int;
 using native_socket = SOCKET;
 #else
@@ -445,6 +452,14 @@ bool io_send_stream(void* context, const Address& to, const uint8_t* bytes, std:
 /// @param capacity entries available in out
 /// @return the entries written; 0 when the system gives no list
 std::size_t list_local_interfaces(Host* h, LocalInterface* out, std::size_t capacity) {
+#if defined(OA_WINDOWS_95)
+    // Winsock 1.1 has no call that lists the interfaces. A search that finds
+    // none of them falls back to the broadcast and loopback addresses.
+    (void)h;
+    (void)out;
+    (void)capacity;
+    return 0;
+#else
     INTERFACE_INFO listed[max_local_interfaces]{};
     DWORD listed_bytes = 0;
     if (WSAIoctl(
@@ -477,6 +492,7 @@ std::size_t list_local_interfaces(Host* h, LocalInterface* out, std::size_t capa
         local.point_to_point = (entry.iiFlags & IFF_POINTTOPOINT) != 0;
     }
     return count;
+#endif
 }
 #else
 /// Copies the IPv4 address out of an interface address.
@@ -1099,6 +1115,16 @@ bool resolve_ipv4(const char* name, uint8_t ip[4]) noexcept {
     }
     if (!platform_startup())
         return false;
+#if defined(OA_WINDOWS_95)
+    // Winsock 1.1 resolves a host name whole, with no service or address
+    // family to ask for.
+    const hostent* const found = gethostbyname(name);
+    if (found == nullptr || found->h_addrtype != AF_INET || found->h_length != 4 ||
+        found->h_addr_list == nullptr || found->h_addr_list[0] == nullptr)
+        return false;
+    std::memcpy(ip, found->h_addr_list[0], 4);
+    return true;
+#else
     addrinfo hints{};
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
@@ -1117,6 +1143,7 @@ bool resolve_ipv4(const char* name, uint8_t ip[4]) noexcept {
     }
     freeaddrinfo(found);
     return resolved;
+#endif
 }
 
 } // namespace oa::netgame::sock
