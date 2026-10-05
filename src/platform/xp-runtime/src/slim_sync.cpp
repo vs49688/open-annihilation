@@ -133,26 +133,32 @@ void unlock_shared(uintptr_t& lock) noexcept {
 // The condition's word counts wake-ups. A waiter notes the count while it
 // still holds the lock, so a wake-up that follows any change the waker made
 // under the lock always changes the count the waiter watches.
+uintptr_t note_condition(uintptr_t& condition) noexcept {
+    return atomic_word(condition).load(std::memory_order_acquire);
+}
+
+bool wait_condition_word(uintptr_t& condition, uintptr_t noted, uint32_t timeout_ms) noexcept {
+    auto wake_ups = atomic_word(condition);
+    const auto started = std::chrono::steady_clock::now();
+    uint32_t attempts = 0;
+    while (wake_ups.load(std::memory_order_acquire) == noted) {
+        if (timeout_ms != wait_forever &&
+            std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(timeout_ms))
+            return false;
+        back_off(attempts);
+    }
+    return true;
+}
+
 bool wait_condition(
     uintptr_t& condition, uintptr_t& lock, uint32_t timeout_ms, bool shared
 ) noexcept {
-    auto wake_ups = atomic_word(condition);
-    const uintptr_t noted = wake_ups.load(std::memory_order_acquire);
+    const uintptr_t noted = note_condition(condition);
     if (shared)
         unlock_shared(lock);
     else
         unlock_exclusive(lock);
-    const auto started = std::chrono::steady_clock::now();
-    bool woken = true;
-    uint32_t attempts = 0;
-    while (wake_ups.load(std::memory_order_acquire) == noted) {
-        if (timeout_ms != wait_forever &&
-            std::chrono::steady_clock::now() - started >= std::chrono::milliseconds(timeout_ms)) {
-            woken = false;
-            break;
-        }
-        back_off(attempts);
-    }
+    const bool woken = wait_condition_word(condition, noted, timeout_ms);
     if (shared)
         lock_shared(lock);
     else

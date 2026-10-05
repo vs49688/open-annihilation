@@ -10,6 +10,20 @@
 
 #include "oa/platform/xp_runtime.hpp"
 
+// The C++ standard headers come first, before the Windows XP declarations are
+// pinned below: they reach the toolchain's thread support, whose condition
+// variables a win32-threaded toolchain declares for the version this file is
+// compiled at, not for Windows XP.
+#include <atomic>
+#include <cctype>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <cwchar>
+#include <cwctype>
+
 // The declarations of Windows XP, so that none of the functions defined here
 // is also declared as the system's; and the module list of the process-status
 // library, which this file's own module list falls back to.
@@ -28,15 +42,6 @@
 #include <windows.h>
 
 #include <psapi.h>
-
-#include <atomic>
-#include <cctype>
-#include <cerrno>
-#include <climits>
-#include <cstdlib>
-#include <cstring>
-#include <cwchar>
-#include <cwctype>
 
 // The symbol a function is defined by, and the import pointer a program
 // calls it through, in MinGW's naming: on 32-bit x86 a leading underscore,
@@ -1084,3 +1089,73 @@ errno_t __cdecl put_environment_variable(const char* name, const char* value) {
 }
 
 OA_XP_DEFINE_LIBRARY(put_environment_variable, _putenv_s);
+
+extern "C" errno_t __cdecl local_time_32(struct tm* out, const __time32_t* timer) __asm__(
+    OA_XP_LIBRARY_SYMBOL(_localtime32_s)
+);
+
+/// Breaks a 32-bit time down into the local time it names, as _localtime32_s
+/// does. The stand-in has the system's localtime fill it in; the C library
+/// Windows 95 ships has no secure form of its own.
+///
+/// @param[out] out receives the broken-down time
+/// @param timer seconds since the epoch
+/// @return 0, or EINVAL for a null argument or a time localtime refuses
+errno_t __cdecl local_time_32(struct tm* out, const __time32_t* timer) {
+    if (out == nullptr || timer == nullptr)
+        return EINVAL;
+    const time_t value = static_cast<time_t>(*timer);
+    const struct tm* broken_down = std::localtime(&value);
+    if (broken_down == nullptr)
+        return EINVAL;
+    *out = *broken_down;
+    return 0;
+}
+
+OA_XP_DEFINE_LIBRARY(local_time_32, _localtime32_s);
+
+// The condition variable of the Windows API, which Windows Vista added and
+// Windows 95 has not. The C++ run-time library's thread support is told that
+// the version compiled for has one (cmake/toolchains/windows-95-gthr.hpp) and
+// builds its condition variables on these calls. The two that wake a waiter
+// are defined beside the slim locks above; making one, and sleeping on one
+// over a critical section, are defined here, over the same word.
+
+/// Makes a condition that no thread waits on.
+extern "C" void WINAPI
+initialize_condition_variable(void** condition) __asm__(
+    OA_XP_SYSTEM_SYMBOL(InitializeConditionVariable, 4)
+);
+
+void WINAPI initialize_condition_variable(void** condition) {
+    word_of(condition) = 0;
+}
+
+OA_XP_DEFINE_SYSTEM(initialize_condition_variable, InitializeConditionVariable, 4);
+
+/// Releases the lock, waits for the condition to be woken, and takes the lock
+/// again.
+///
+/// @return TRUE when woken, or FALSE with ERROR_TIMEOUT when the time ran out
+extern "C" BOOL WINAPI sleep_condition_variable_cs(
+    void** condition, void* section, DWORD timeout_ms
+) __asm__(OA_XP_SYSTEM_SYMBOL(SleepConditionVariableCS, 12));
+
+BOOL WINAPI sleep_condition_variable_cs(void** condition, void* section, DWORD timeout_ms) {
+    // The count is noted before the lock is released, so a wake that comes
+    // between the two is not lost.
+    const uintptr_t noted = xp::note_condition(word_of(condition));
+    auto* lock = static_cast<LPCRITICAL_SECTION>(section);
+    LeaveCriticalSection(lock);
+    const bool woken = xp::wait_condition_word(
+        word_of(condition), noted, timeout_ms == INFINITE ? xp::wait_forever : timeout_ms
+    );
+    EnterCriticalSection(lock);
+    if (!woken) {
+        SetLastError(ERROR_TIMEOUT);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+OA_XP_DEFINE_SYSTEM(sleep_condition_variable_cs, SleepConditionVariableCS, 12);

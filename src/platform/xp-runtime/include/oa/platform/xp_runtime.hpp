@@ -47,6 +47,27 @@ void lock_shared(uintptr_t& lock) noexcept;
 /// @param[in,out] lock the lock's word
 void unlock_shared(uintptr_t& lock) noexcept;
 
+/// The count a condition's word holds now.
+///
+/// Noted while the lock that guards the condition is still held, so that a
+/// wake between noting the count and releasing that lock is not lost.
+///
+/// @param[in,out] condition the condition's word
+/// @return the count, to pass to wait_condition_word
+uintptr_t note_condition(uintptr_t& condition) noexcept;
+
+/// Waits until a condition's word holds a count other than the one noted,
+/// releasing and taking no lock itself.
+///
+/// A wait may end without a wake-up, as on Windows; the caller checks its
+/// condition again.
+///
+/// @param[in,out] condition the condition's word
+/// @param noted the count note_condition returned
+/// @param timeout_ms longest wait in milliseconds, or wait_forever
+/// @return false when the time ran out before a wake-up
+bool wait_condition_word(uintptr_t& condition, uintptr_t noted, uint32_t timeout_ms) noexcept;
+
 /// Releases a slim lock, waits for the condition to be woken, and takes the lock again.
 ///
 /// A wait may end without a wake-up, as on Windows; the caller checks its
