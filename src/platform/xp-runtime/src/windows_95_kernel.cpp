@@ -107,6 +107,9 @@ using FindFirstFileExFunction = HANDLE(WINAPI*)(
 );
 using GetFileAttributesExFunction =
     BOOL(WINAPI*)(LPCWSTR name, GET_FILEEX_INFO_LEVELS level, LPVOID data);
+using GetDiskFreeSpaceExFunction = BOOL(WINAPI*)(
+    LPCWSTR directory, PULARGE_INTEGER available, PULARGE_INTEGER total, PULARGE_INTEGER free
+);
 using GetFileSizeExFunction = BOOL(WINAPI*)(HANDLE file, PLARGE_INTEGER size);
 using GetLongPathNameFunction = DWORD(WINAPI*)(LPCWSTR name, LPWSTR long_name, DWORD capacity);
 using GetModuleHandleExFunction = BOOL(WINAPI*)(DWORD flags, LPCWSTR name, HMODULE* module);
@@ -137,6 +140,9 @@ constinit SystemFunction<CreateHardLinkFunction> system_create_hard_link{
 };
 constinit SystemFunction<FindFirstFileExFunction> system_find_first_file_ex{
     kernel32, "FindFirstFileExW"
+};
+constinit SystemFunction<GetDiskFreeSpaceExFunction> system_get_disk_free_space_ex{
+    kernel32, "GetDiskFreeSpaceExW"
 };
 constinit SystemFunction<GetFileAttributesExFunction> system_get_file_attributes_ex{
     kernel32, "GetFileAttributesExW"
@@ -440,6 +446,52 @@ BOOL WINAPI get_file_attributes_ex(LPCWSTR name, GET_FILEEX_INFO_LEVELS level, L
 }
 
 OA_XP_DEFINE_SYSTEM(get_file_attributes_ex, GetFileAttributesExW, 12);
+
+/// Reads a volume's size and the room left on it.
+///
+/// Windows 95 RTM has only the call that answers in clusters, which the three
+/// totals the caller asks for are worked out from; OSR2 and every later
+/// Windows have this one.
+///
+/// @param directory a folder on the volume
+/// @param[out] available the room the calling user may use
+/// @param[out] total the volume's size
+/// @param[out] free_space the room free on it
+/// @return true when the volume was read
+extern "C" BOOL WINAPI get_disk_free_space_ex(
+    LPCWSTR directory, PULARGE_INTEGER available, PULARGE_INTEGER total, PULARGE_INTEGER free_space
+) __asm__(OA_XP_SYSTEM_SYMBOL(GetDiskFreeSpaceExW, 16));
+
+BOOL WINAPI get_disk_free_space_ex(
+    LPCWSTR directory, PULARGE_INTEGER available, PULARGE_INTEGER total, PULARGE_INTEGER free_space
+) {
+    if (const auto system = system_get_disk_free_space_ex.get())
+        return system(directory, available, total, free_space);
+    char narrow[MAX_PATH + 1]{};
+    if (WideCharToMultiByte(CP_ACP, 0, directory, -1, narrow, sizeof(narrow), nullptr, nullptr) == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    DWORD sectors_per_cluster = 0;
+    DWORD bytes_per_sector = 0;
+    DWORD free_clusters = 0;
+    DWORD all_clusters = 0;
+    if (GetDiskFreeSpaceA(
+            narrow, &sectors_per_cluster, &bytes_per_sector, &free_clusters, &all_clusters
+        ) == FALSE)
+        return FALSE;
+    const ULONGLONG cluster_bytes =
+        static_cast<ULONGLONG>(sectors_per_cluster) * bytes_per_sector;
+    if (available != nullptr)
+        available->QuadPart = cluster_bytes * free_clusters;
+    if (total != nullptr)
+        total->QuadPart = cluster_bytes * all_clusters;
+    if (free_space != nullptr)
+        free_space->QuadPart = cluster_bytes * free_clusters;
+    return TRUE;
+}
+
+OA_XP_DEFINE_SYSTEM(get_disk_free_space_ex, GetDiskFreeSpaceExW, 16);
 
 /// Reads a file's size, which Windows 95 answers in two halves.
 ///
