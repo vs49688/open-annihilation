@@ -10,6 +10,7 @@
 // reaches the simulation, a saved game or what a shared game sends.
 
 #include "language_state.hpp"
+#include "oa/platform/system.hpp"
 #include "oa/app/game_directory.hpp"
 #include "oa/app/runtime.hpp"
 
@@ -121,10 +122,10 @@ void Runtime::start_language() {
 
 void Runtime::read_interface_catalogue() {
     auto& state = language_state();
-    const char* base = SDL_GetBasePath();
-    if (base == nullptr)
+    const std::string base = oa::platform::program_directory();
+    if (base.empty())
         return;
-    const fs::path folder = path_from_utf8(base) / path_from_utf8(kCatalogueFolder);
+    const fs::path folder = path_from_utf8(base.c_str()) / path_from_utf8(kCatalogueFolder);
     std::error_code error;
     if (!fs::is_directory(folder, error))
         return;

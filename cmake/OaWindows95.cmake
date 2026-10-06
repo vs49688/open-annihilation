@@ -32,15 +32,26 @@ if(OA_WINDOWS_95)
   # declares and oa-platform-xp-runtime defines over the calls 95 does have.
   # OA_WINDOWS_95 is defined as well, for a source that must choose between
   # what 95 has and what a later Windows has, such as Winsock 1.1 and 2.
+  # SDL_MAIN_HANDLED: SDL's own entry point does not work on Windows 95 —
+  # with <SDL3/SDL_main.h> included, SDL renames this program's main to
+  # SDL_main and supplies the entry itself, and on this system that entry
+  # returns -1 before main is reached. Handling main here is what makes the
+  # program run at all. (Measured: a build without it starts, writes nothing,
+  # shows nothing and exits 0xffffffff before parsing its options.)
   target_compile_definitions(
     oa-options INTERFACE _WIN32_WINDOWS=0x0400 _WIN32_WINNT=0x0400 WINVER=0x0400 OA_WINDOWS_95=1
+                            SDL_MAIN_HANDLED=1
   )
   # Windows 95 refuses to load a program whose subsystem or system version is
   # newer than it is, so both are stamped 4.0: the subsystem version the
   # loader checks, and the minimum operating system the image names.
   target_link_options(oa-options INTERFACE
     "LINKER:--major-subsystem-version,4" "LINKER:--minor-subsystem-version,0"
-    "LINKER:--major-os-version,4" "LINKER:--minor-os-version,0")
+    "LINKER:--major-os-version,4" "LINKER:--minor-os-version,0"
+    # TEMPORARY diagnostic scaffolding: takes every C++ throw in the program
+    # through the reporting wrapper, since calls inside a static library are
+    # not otherwise interceptable. Remove with src/oa_stop_report.cpp.
+    "LINKER:--wrap=__cxa_throw")
   # Every executable links oa-platform-xp-runtime whole, as a Windows XP build
   # does: it defines the functions the C++ run-time library calls that the C
   # library Windows 95 ships does not have — _putenv_s, wcrtomb_s and the _l

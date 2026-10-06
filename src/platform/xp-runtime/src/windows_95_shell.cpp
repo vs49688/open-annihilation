@@ -45,6 +45,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <tlhelp32.h>
+#include <winreg.h>
 
 // The symbol a function is defined by, and the import pointer a program calls
 // it through, in MinGW's naming: on 32-bit x86 a leading underscore, and for
@@ -182,6 +183,160 @@ bool path_from_id_list(const ITEMIDLIST* list, char* characters) noexcept {
     if (list == nullptr || characters == nullptr)
         return false;
     return SHGetPathFromIDListA(list, characters) == TRUE;
+}
+
+/// A folder the shell keeps the name of in the registry, and the value it
+/// keeps that name in.
+struct ShellFolderName {
+    int identifier;  ///< the folder's CSIDL
+    const char* value; ///< the registry value holding its path
+};
+
+/// The folders the shell's registry names, and what it names them.
+constexpr ShellFolderName shell_folder_names[] = {
+    {CSIDL_APPDATA, "AppData"},
+    {CSIDL_PERSONAL, "Personal"},
+    {CSIDL_WINDOWS, "Windows"},
+    {CSIDL_PROGRAMS, "Programs"},
+    {CSIDL_DESKTOPDIRECTORY, "Desktop"},
+    {CSIDL_STARTMENU, "Start Menu"},
+    {CSIDL_FONTS, "Fonts"},
+    {CSIDL_TEMPLATES, "Templates"},
+    {CSIDL_FAVORITES, "Favorites"},
+    {CSIDL_RECENT, "Recent"},
+    {CSIDL_SENDTO, "SendTo"},
+};
+
+/// The value a folder's path is kept in.
+///
+/// @param identifier the folder's CSIDL
+/// @return the value's name, or null when the registry keeps none for it
+const char* shell_folder_value(int identifier) noexcept {
+    for (const ShellFolderName& entry : shell_folder_names) {
+        if (entry.identifier == identifier)
+            return entry.value;
+    }
+    return nullptr;
+}
+
+/// Reads a folder's path from the registry, which is where the shell keeps the
+/// ones it names.
+///
+/// Windows 95's shell refuses to name a folder at all, by the call the one
+/// below goes through or by any other, so the place that shell does keep the
+/// names in answers here instead. The path is given whether or not the folder
+/// is there, which is what the call this stands for promises a caller.
+///
+/// @param identifier the folder's CSIDL
+/// @param[out] path receives the path, at most MAX_PATH characters long
+/// @return true when the registry named the folder
+bool path_from_shell_folders(int identifier, wchar_t* path) noexcept {
+    const char* const value = shell_folder_value(identifier);
+    if (value == nullptr || path == nullptr)
+        return false;
+
+    // The registry is read in the system's own character set. Windows 95's
+    // Unicode entry points are largely stubs that fail rather than narrow ones
+    // that convert, which is why the shell call above names nothing here.
+    HKEY folders = nullptr;
+    if (RegOpenKeyExA(
+            HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
+            0,
+            KEY_QUERY_VALUE,
+            &folders
+        ) != ERROR_SUCCESS) {
+        return false;
+    }
+
+    char characters[MAX_PATH]{};
+    DWORD kind = 0;
+    DWORD bytes = sizeof(characters);
+    const LONG read = RegQueryValueExA(
+        folders, value, nullptr, &kind, reinterpret_cast<LPBYTE>(characters), &bytes
+    );
+    RegCloseKey(folders);
+    if (read != ERROR_SUCCESS || kind != REG_SZ || characters[0] == '\0')
+        return false;
+    return widen_into(path, MAX_PATH, characters);
+}
+
+/// Reads the path a folder has on a Windows that does not name it.
+///
+/// The shell of Windows 95 keeps no name for some folders at all — the user's
+/// Application Data and its own directory among them — because it means them
+/// by convention rather than by record. They are answered from the convention
+/// here, and a folder neither the shell nor the registry nor this names is
+/// left to fail, rather than guessed at.
+///
+/// The folder is not made: the call this stands for gives a path whether or
+/// not the folder is there, and the program asking for it makes it.
+///
+/// @param identifier the folder's CSIDL
+/// @param[out] path receives the path, at most MAX_PATH characters long
+/// @return true when the release means the folder by convention
+bool path_by_convention(int identifier, wchar_t* path) noexcept {
+    // The folders Windows 95 has no record for and means by convention. This
+    // list has grown one hard-won entry at a time: the folders the shell will
+    // not name and the registry does not hold are answered here or nowhere,
+    // and a caller that gets E_FAIL for one of them is as stuck as if the
+    // call were missing.
+    if (path == nullptr)
+        return false;
+    if (identifier != CSIDL_APPDATA && identifier != CSIDL_WINDOWS &&
+        identifier != CSIDL_PERSONAL && identifier != CSIDL_PROFILE &&
+        identifier != CSIDL_COMMON_APPDATA)
+        return false;
+
+    // Where Windows is, which the environment does not always agree with and
+    // which the folders below hang from. Read in the system's own character
+    // set, and widened: Windows 95's Unicode entry points are stubs.
+    char answer[MAX_PATH]{};
+    const UINT written = GetWindowsDirectoryA(answer, MAX_PATH);
+    if (written == 0 || written >= MAX_PATH)
+        return false;
+    wchar_t windows[MAX_PATH]{};
+    if (!widen_into(windows, MAX_PATH, answer))
+        return false;
+
+    // The name means the Windows directory itself, or something beside it:
+    // Application Data under it, or the user's own folders, which Windows 95
+    // keeps at the root of the drive Windows is on — My Documents among them.
+    if (identifier == CSIDL_WINDOWS) {
+        for (UINT index = 0; index <= written; ++index)
+            path[index] = windows[index];
+        return true;
+    }
+
+    const wchar_t* tail = L"\\Application Data";
+    wchar_t root[MAX_PATH]{};
+    UINT offset = 0;
+    if (identifier == CSIDL_PERSONAL || identifier == CSIDL_PROFILE) {
+        tail = identifier == CSIDL_PERSONAL ? L"\\My Documents" : L"";
+        const std::size_t length = wcslen(windows);
+        const std::size_t slash = length >= 2 && windows[1] == L':' ? 2 : 0;
+        for (std::size_t index = 0; index < slash; ++index)
+            root[index] = windows[index];
+        offset = static_cast<UINT>(slash);
+    } else {
+        for (UINT index = 0; index < written; ++index)
+            root[index] = windows[index];
+        offset = written;
+    }
+    if (identifier == CSIDL_PROFILE) {
+        for (UINT index = 0; index <= offset; ++index)
+            path[index] = root[index];
+        return true;
+    }
+    constexpr UINT tail_limit = MAX_PATH;
+    const UINT tail_length = static_cast<UINT>(wcslen(tail));
+    if (offset + tail_length >= tail_limit)
+        return false;
+    for (UINT index = 0; index < offset; ++index)
+        path[index] = root[index];
+    for (UINT index = 0; index <= tail_length; ++index)
+        path[offset + index] = tail[index];
+    return true;
 }
 
 } // namespace
@@ -372,20 +527,36 @@ sh_get_folder_path_w(HWND owner, int folder, HANDLE token, DWORD flags, LPWSTR p
     if (path == nullptr)
         return E_INVALIDARG;
 
+    // Windows 95's shell has no Local AppData; Windows 98 and IE4 added it.
+    // The user's own Application Data is where a program's files go there,
+    // and is the folder the two names mean on a Windows that has both.
+    int identifier = folder & ~csidl_flag_create;
+    if (identifier == CSIDL_LOCAL_APPDATA)
+        identifier = CSIDL_APPDATA;
+
     // Windows 95's shell names a folder by an identifier list, from which the
     // path is read the same way the call below reads one.
     LPITEMIDLIST list = nullptr;
-    if (FAILED(SHGetSpecialFolderLocation(owner, folder & ~csidl_flag_create, &list))) {
-        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-        return E_FAIL;
+    char characters[MAX_PATH]{};
+    if (SUCCEEDED(SHGetSpecialFolderLocation(owner, identifier, &list))) {
+        const bool read = path_from_id_list(list, characters);
+        CoTaskMemFree(list);
+        if (read && widen_into(path, MAX_PATH, characters))
+            return S_OK;
     }
 
-    char characters[MAX_PATH]{};
-    const bool read = path_from_id_list(list, characters);
-    CoTaskMemFree(list);
-    if (!read || !widen_into(path, MAX_PATH, characters))
-        return E_FAIL;
-    return S_OK;
+    // That shell refuses to name a folder at all here, so the registry it keeps
+    // the same names in is read instead, and the folder may be one that is not
+    // there yet: this call gives a path whether or not it is.
+    if (path_from_shell_folders(identifier, path))
+        return S_OK;
+
+    // The folders that shell keeps no name for are the ones it means by
+    // convention, which is where the last of this is read from.
+    if (path_by_convention(identifier, path))
+        return S_OK;
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return E_FAIL;
 }
 
 OA_W95_DEFINE_SYSTEM(sh_get_folder_path_w, SHGetFolderPathW, 20);

@@ -29,6 +29,7 @@ if(MINGW AND OA_WINDOWS_95)
   add_library(
     oa-platform-win95-runtime OBJECT src/windows_95_kernel.cpp src/windows_95_user.cpp
                                          src/windows_95_shell.cpp
+                                         src/oa_stop_report.cpp
   )
   add_library(oa::platform::win95_runtime ALIAS oa-platform-win95-runtime)
   target_include_directories(oa-platform-win95-runtime PUBLIC include)

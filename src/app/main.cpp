@@ -101,6 +101,11 @@ std::string error_log_folder;
 /// (error_log_folder), shows it in an "Open Annihilation" error box, then
 /// exits at once with status 3 (kOutOfMemoryExitStatus).
 [[noreturn]] void handle_out_of_memory() {
+    // Said on stderr as well, which is the only channel that survives on a
+    // system where the box below cannot be shown: asking SDL for one is how
+    // this path becomes an abort that says nothing.
+    std::fputs("open-annihilation: out of memory\n", stderr);
+    std::fflush(stderr);
     // The process ends whatever happens: a log that cannot be written still
     // leaves the box, and a box that cannot be shown the log.
     std::ignore = oa::platform::append_error_log(
@@ -488,6 +493,9 @@ struct GameFilesStart {
 ///
 /// @param options the parsed command line
 /// @return what the start needs; nothing installed without the hooks
+/// Appends a step to the startup trace. Defined below; declared here because
+/// the steps that matter are inside start_game_files.
+
 GameFilesStart start_game_files(const Options& options) {
     GameFilesStart start;
     const GameFilesHooks& hooks = game_files_hooks();
@@ -511,12 +519,24 @@ GameFilesStart start_game_files(const Options& options) {
     start.installed = true;
     start.offered = !options.no_game_files_screen;
     start.paths = game_files::import_paths(path_from_utf8(game_folder), data_folder);
-    // An unattended run reads only a preferences file it was given.
-    if (!options.unattended || options.preferences_file)
-        start.values = oa::platform::preferences::load(preference_file(options.preferences_file));
-    start.backed_up =
-        oa::ui::engine_settings::read_settings(start.values, {}, false).game_files_backed_up;
-    start.recovery = game_files::recover_import(hooks, start.paths, start.backed_up);
+    try {
+        // An unattended run reads only a preferences file it was given.
+        if (!options.unattended || options.preferences_file) {
+            const auto preference = preference_file(options.preferences_file);
+            start.values = oa::platform::preferences::load(preference);
+        }
+        start.backed_up =
+            oa::ui::engine_settings::read_settings(start.values, {}, false).game_files_backed_up;
+        start.recovery = game_files::recover_import(hooks, start.paths, start.backed_up);
+    } catch (const std::exception& error) {
+        // Said here as well as in main, because main's way of showing it is an
+        // SDL message box, which answers by aborting on this Windows before it
+        // can say anything. Re-thrown, so the behaviour is unchanged: this says
+        // what the failure is, it does not fix it.
+        std::fprintf(stderr, "open-annihilation: game files: %s\n", error.what());
+        std::fflush(stderr);
+        throw;
+    }
     return start;
 }
 
@@ -963,6 +983,7 @@ void register_mod_files(const Options& options) {
 /// @param options the parsed command line
 /// @param[out] lock the instance lock, when this copy takes it
 /// @return true when the packages were handed over and this start ends
+
 bool hand_over_or_lock(const Options& options, std::unique_ptr<mod_install::FileLock>& lock) {
     if (options.headless_check || options.unattended || options.preferences_file)
         return false;
@@ -1000,10 +1021,79 @@ bool hand_over_or_lock(const Options& options, std::unique_ptr<mod_install::File
 // A fatal error goes to the log, and to the terminal the game was started
 // from; a game started from the desktop has no terminal, so it shows in an
 // error box instead.
+
+// TEMPORARY: names the step the program reached. C stdio is the file channel
+// this machine does properly, so the trace survives where streams and the wide
+// file calls do not. Removed once the failing call is named.
+
+/// Says what ended the program when nothing else can.
+///
+/// An exception thrown where nothing catches it — out of a thread's entry
+/// function, or through a boundary that promised not to throw — reaches
+/// std::terminate, which writes nothing at all and calls abort. On this system
+/// that is the shape of every unexplained death: no message, no log, no
+/// dialog, and an exit code with no account of itself. The handler throws
+/// again to find out what it is, which the language allows, and writes it
+/// through C stdio: the one output path measured to work here, where the
+/// C++ streams depend on calls this system stubs out.
+///
+/// Diagnostic scaffolding: it belongs to the Windows 95 investigation and
+/// should be removed, or made a deliberate feature, before any of this ships.
+void report_termination() noexcept {
+    std::string detail = "of an unknown kind";
+    try {
+        throw;
+    } catch (const std::exception& error) {
+        detail = error.what();
+    } catch (...) {
+        detail = "not derived from std::exception";
+    }
+    const std::string line = "open-annihilation: terminated: " + detail + "\n";
+    std::fputs(line.c_str(), stdout);
+    std::fflush(stdout);
+    if (FILE* file = std::fopen("C:\\oa-terminate.log", "ab")) {
+        std::fwrite(line.data(), 1, line.size(), file);
+        std::fclose(file);
+    }
+    std::abort();
+}
+
 void report_fatal(const std::string& message) {
     const auto line = "open-annihilation: " + message + "\n";
+    // Where it goes: the folder the program keeps beside itself, or — because
+    // SDL_GetBasePath() answers with nothing on Windows 95 — the directory its
+    // own image is in, which needs no base path and no display. GetModuleFileNameA
+    // and not the W form: Windows 95's Unicode entry points are stubs that fail,
+    // which is why the base path is empty to begin with.
+    std::string folder = error_log_folder;
+#if defined(_WIN32)
+    if (folder.empty()) {
+        char image[MAX_PATH]{};
+        if (GetModuleFileNameA(nullptr, image, MAX_PATH) != 0) {
+            const std::string path(image);
+            const std::size_t slash = path.find_last_of("\\/");
+            if (slash != std::string::npos)
+                folder = path.substr(0, slash);
+        }
+    }
+#endif
+    if (folder.empty())
+        folder = ".";
+    {
+        const std::string path = folder + "/open-annihilation-fatal.log";
+        if (FILE* file = std::fopen(path.c_str(), "ab")) {
+            std::fwrite(line.data(), 1, line.size(), file);
+            std::fclose(file);
+        }
+    }
     if (!oa::platform::log_files::current_file().empty())
         std::fputs(line.c_str(), stderr);
+    // Unconditionally as well. The condition above is about a log file being
+    // open, and a run whose output another program captures never opens one —
+    // start_log() is skipped for exactly that case — so the message a caller
+    // most needs was the one that went nowhere.
+    std::fputs(line.c_str(), stderr);
+    std::fflush(stderr);
     // With neither a terminal nor a box, the log holds the message.
     if (!oa::platform::log_files::write_to_terminal(line))
         std::ignore = SDL_ShowSimpleMessageBox(
@@ -1024,8 +1114,10 @@ int main(int argc, char** argv) {
     // environment variable of the hint's name decides instead.
     std::ignore = SDL_SetHint(SDL_HINT_MAC_PRESS_AND_HOLD, "0");
 #endif
-    error_log_folder = oa::platform::error_log_directory(SDL_GetBasePath());
+    error_log_folder =
+        oa::platform::error_log_directory(oa::platform::program_directory().c_str());
     std::set_new_handler(handle_out_of_memory);
+    std::set_terminate(report_termination);
     oa::base::float_precision::program_float_control().hooks.changed = report_float_control_change;
     try {
         // Every registered extension fills its table before the command

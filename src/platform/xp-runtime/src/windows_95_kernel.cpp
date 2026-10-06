@@ -141,6 +141,48 @@ constinit SystemFunction<CreateHardLinkFunction> system_create_hard_link{
 constinit SystemFunction<FindFirstFileExFunction> system_find_first_file_ex{
     kernel32, "FindFirstFileExW"
 };
+using WideFindFirstFunction = HANDLE(WINAPI*)(LPCWSTR, LPWIN32_FIND_DATAW);
+using WideFindNextFunction = BOOL(WINAPI*)(HANDLE, LPWIN32_FIND_DATAW);
+using WideGetFileAttributesFunction = DWORD(WINAPI*)(LPCWSTR);
+using WideGetTempPathFunction = DWORD(WINAPI*)(DWORD, LPWSTR);
+constinit SystemFunction<WideFindFirstFunction> system_wide_find_first{kernel32, "FindFirstFileW"};
+constinit SystemFunction<WideFindNextFunction> system_wide_find_next{kernel32, "FindNextFileW"};
+constinit SystemFunction<WideGetFileAttributesFunction> system_wide_get_file_attributes{
+    kernel32, "GetFileAttributesW"
+};
+constinit SystemFunction<WideGetTempPathFunction> system_wide_get_temp_path{
+    kernel32, "GetTempPathW"
+};
+using WideGetFullPathNameFunction = DWORD(WINAPI*)(LPCWSTR, DWORD, LPWSTR, LPWSTR*);
+using WideCreateDirectoryFunction = BOOL(WINAPI*)(LPCWSTR, LPSECURITY_ATTRIBUTES);
+using WideSetCurrentDirectoryFunction = BOOL(WINAPI*)(LPCWSTR);
+using WideMoveFileFunction = BOOL(WINAPI*)(LPCWSTR, LPCWSTR);
+using WideDeleteFileFunction = BOOL(WINAPI*)(LPCWSTR);
+using WideCopyFileFunction = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, BOOL);
+constinit SystemFunction<WideGetFullPathNameFunction> system_wide_get_full_path_name{
+    kernel32, "GetFullPathNameW"
+};
+constinit SystemFunction<WideCreateDirectoryFunction> system_wide_create_directory{
+    kernel32, "CreateDirectoryW"
+};
+constinit SystemFunction<WideSetCurrentDirectoryFunction> system_wide_set_current_directory{
+    kernel32, "SetCurrentDirectoryW"
+};
+constinit SystemFunction<WideMoveFileFunction> system_wide_move_file{kernel32, "MoveFileW"};
+constinit SystemFunction<WideDeleteFileFunction> system_wide_delete_file{kernel32, "DeleteFileW"};
+constinit SystemFunction<WideCopyFileFunction> system_wide_copy_file{kernel32, "CopyFileW"};
+using WideGetEnvironmentStringsFunction = LPWSTR(WINAPI*)();
+using WideFreeEnvironmentStringsFunction = BOOL(WINAPI*)(LPWSTR);
+constinit SystemFunction<WideGetEnvironmentStringsFunction> system_wide_get_environment_strings{
+    kernel32, "GetEnvironmentStringsW"
+};
+constinit SystemFunction<WideFreeEnvironmentStringsFunction> system_wide_free_environment_strings{
+    kernel32, "FreeEnvironmentStringsW"
+};
+using OutputDebugStringFunction = void(WINAPI*)(LPCWSTR);
+constinit SystemFunction<OutputDebugStringFunction> system_output_debug_string{
+    kernel32, "OutputDebugStringW"
+};
 constinit SystemFunction<GetDiskFreeSpaceExFunction> system_get_disk_free_space_ex{
     kernel32, "GetDiskFreeSpaceExW"
 };
@@ -197,7 +239,11 @@ constexpr DWORD version_fields[] = {
 /// @param version the description
 /// @param field index into version_fields
 /// @return the field's value
-DWORD version_field_value(const OSVERSIONINFOEXW& version, std::size_t field) noexcept {
+// A template: the caller's description is the wide one and the
+// running Windows' is read through the narrow call, and the two hold the
+// same fields.
+template <typename Version>
+DWORD version_field_value(const Version& version, std::size_t field) noexcept {
     switch (field) {
     case 0:
         return version.dwMinorVersion;
@@ -430,8 +476,18 @@ BOOL WINAPI get_file_attributes_ex(LPCWSTR name, GET_FILEEX_INFO_LEVELS level, L
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    WIN32_FIND_DATAW found{};
-    const HANDLE search = FindFirstFileW(name, &found);
+    // Built from FindFirstFileA, which Windows 95 has, rather than from its
+    // FindFirstFileW twin, which Windows 95 exports as a stub that fails — and
+    // not from GetFileAttributesExA either: that name is no older, since no
+    // Windows before 98 has GetFileAttributesEx in either form. What is filled
+    // in here is numbers, so nothing has to be widened back.
+    char narrow[MAX_PATH + 1]{};
+    if (WideCharToMultiByte(CP_ACP, 0, name, -1, narrow, sizeof(narrow), nullptr, nullptr) == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    WIN32_FIND_DATAA found{};
+    const HANDLE search = FindFirstFileA(narrow, &found);
     if (search == INVALID_HANDLE_VALUE)
         return FALSE;
     FindClose(search);
@@ -493,6 +549,397 @@ BOOL WINAPI get_disk_free_space_ex(
 
 OA_XP_DEFINE_SYSTEM(get_disk_free_space_ex, GetDiskFreeSpaceExW, 16);
 
+// The wide file calls Windows 95 exports are stubs: measured on OSR2,
+// FindFirstFileW, GetFileAttributesW and GetTempPathW all answer
+// ERROR_CALL_NOT_IMPLEMENTED while their system-character-set twins succeed.
+// They are answered here from those twins and the result widened, which is the
+// only place this can be fixed once for everybody: mingw's std::filesystem, SDL
+// and this program's own callers all reach the wide names, and no import audit
+// can see a call that is present but refuses.
+
+/// Widens a find result, whose numbers are the same in both forms.
+void widen_find_data(WIN32_FIND_DATAW& wide, const WIN32_FIND_DATAA& narrow) noexcept {
+    wide.dwFileAttributes = narrow.dwFileAttributes;
+    wide.ftCreationTime = narrow.ftCreationTime;
+    wide.ftLastAccessTime = narrow.ftLastAccessTime;
+    wide.ftLastWriteTime = narrow.ftLastWriteTime;
+    wide.nFileSizeHigh = narrow.nFileSizeHigh;
+    wide.nFileSizeLow = narrow.nFileSizeLow;
+    wide.dwReserved0 = narrow.dwReserved0;
+    wide.dwReserved1 = narrow.dwReserved1;
+    MultiByteToWideChar(CP_ACP, 0, narrow.cFileName, -1, wide.cFileName, MAX_PATH);
+    MultiByteToWideChar(CP_ACP, 0, narrow.cAlternateFileName, -1, wide.cAlternateFileName, 14);
+}
+
+/// Finds the first name a pattern names.
+extern "C" HANDLE WINAPI wide_find_first_file(
+    LPCWSTR name, LPWIN32_FIND_DATAW data
+) __asm__(OA_XP_SYSTEM_SYMBOL(FindFirstFileW, 8));
+
+HANDLE WINAPI wide_find_first_file(LPCWSTR name, LPWIN32_FIND_DATAW data) {
+    if (const auto system = system_wide_find_first.get())
+        return system(name, data);
+    if (name == nullptr || data == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    char narrow_name[MAX_PATH + 1]{};
+    if (WideCharToMultiByte(
+            CP_ACP, 0, name, -1, narrow_name, sizeof(narrow_name), nullptr, nullptr
+        ) == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    WIN32_FIND_DATAA narrow{};
+    const HANDLE search = FindFirstFileA(narrow_name, &narrow);
+    if (search == INVALID_HANDLE_VALUE)
+        return search;
+    widen_find_data(*data, narrow);
+    return search;
+}
+
+OA_XP_DEFINE_SYSTEM(wide_find_first_file, FindFirstFileW, 8);
+
+/// Finds the name after the one a search last answered with.
+extern "C" BOOL WINAPI wide_find_next_file(
+    HANDLE search, LPWIN32_FIND_DATAW data
+) __asm__(OA_XP_SYSTEM_SYMBOL(FindNextFileW, 8));
+
+BOOL WINAPI wide_find_next_file(HANDLE search, LPWIN32_FIND_DATAW data) {
+    if (const auto system = system_wide_find_next.get())
+        return system(search, data);
+    if (data == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    WIN32_FIND_DATAA narrow{};
+    if (FindNextFileA(search, &narrow) == FALSE)
+        return FALSE;
+    widen_find_data(*data, narrow);
+    return TRUE;
+}
+
+OA_XP_DEFINE_SYSTEM(wide_find_next_file, FindNextFileW, 8);
+
+/// Reads a file's attributes.
+extern "C" DWORD WINAPI wide_get_file_attributes(LPCWSTR name) __asm__(
+    OA_XP_SYSTEM_SYMBOL(GetFileAttributesW, 4)
+);
+
+DWORD WINAPI wide_get_file_attributes(LPCWSTR name) {
+    if (const auto system = system_wide_get_file_attributes.get()) {
+        return system(name);
+    }
+    if (name == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    char narrow_name[MAX_PATH + 1]{};
+    if (WideCharToMultiByte(
+            CP_ACP, 0, name, -1, narrow_name, sizeof(narrow_name), nullptr, nullptr
+        ) == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    const DWORD answer = GetFileAttributesA(narrow_name);
+    return answer;
+}
+
+OA_XP_DEFINE_SYSTEM(wide_get_file_attributes, GetFileAttributesW, 4);
+
+/// Gives the folder temporary files go in.
+extern "C" DWORD WINAPI wide_get_temp_path(DWORD length, LPWSTR path) __asm__(
+    OA_XP_SYSTEM_SYMBOL(GetTempPathW, 8)
+);
+
+DWORD WINAPI wide_get_temp_path(DWORD length, LPWSTR path) {
+    if (const auto system = system_wide_get_temp_path.get())
+        return system(length, path);
+    if (path == nullptr || length == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    char narrow[MAX_PATH + 1]{};
+    const DWORD capacity = length < sizeof(narrow) ? length : sizeof(narrow);
+    const DWORD written = GetTempPathA(capacity, narrow);
+    if (written == 0 || written >= capacity) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    if (MultiByteToWideChar(CP_ACP, 0, narrow, -1, path, static_cast<int>(length)) == 0)
+        return 0;
+    return written;
+}
+
+OA_XP_DEFINE_SYSTEM(wide_get_temp_path, GetTempPathW, 8);
+
+// The rest of the family, each measured on OSR2 as returning
+// ERROR_CALL_NOT_IMPLEMENTED while its system-character-set twin succeeds.
+// A path is narrowed; a result that is a path or a count is written as it comes
+// back from the twin.
+
+/// Narrows a path, answering false when it will not fit.
+bool narrow_path(LPCWSTR wide, char* narrow, int capacity) noexcept {
+    if (wide == nullptr || narrow == nullptr)
+        return false;
+    return WideCharToMultiByte(CP_ACP, 0, wide, -1, narrow, capacity, nullptr, nullptr) != 0;
+}
+
+/// Gives the full path of a name.
+extern "C" DWORD WINAPI wide_get_full_path_name(
+    LPCWSTR name, DWORD length, LPWSTR path, LPWSTR* file_part
+) __asm__(OA_XP_SYSTEM_SYMBOL(GetFullPathNameW, 16));
+
+DWORD WINAPI wide_get_full_path_name(LPCWSTR name, DWORD length, LPWSTR path, LPWSTR* file_part) {
+    if (const auto system = system_wide_get_full_path_name.get())
+        return system(name, length, path, file_part);
+    char narrow_name[MAX_PATH + 1]{};
+    if (!narrow_path(name, narrow_name, sizeof(narrow_name))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if (path == nullptr || length == 0) {
+        // The caller is asking how much room the answer needs.
+        return GetFullPathNameA(narrow_name, 0, nullptr, nullptr);
+    }
+    char narrow_path_out[MAX_PATH + 1]{};
+    char* narrow_file_part = nullptr;
+    const DWORD written =
+        GetFullPathNameA(narrow_name, static_cast<DWORD>(sizeof(narrow_path_out)), narrow_path_out, &narrow_file_part);
+    if (written == 0)
+        return 0;
+    if (written >= length) {
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return written;
+    }
+    if (MultiByteToWideChar(CP_ACP, 0, narrow_path_out, -1, path, static_cast<int>(length)) == 0)
+        return 0;
+    if (file_part != nullptr) {
+        // The file part is where the twin's own pointer lands in the answer.
+        const std::size_t offset = narrow_file_part != nullptr
+                                       ? static_cast<std::size_t>(narrow_file_part - narrow_path_out)
+                                       : 0;
+        *file_part = path + offset;
+    }
+    return written;
+}
+
+OA_XP_DEFINE_SYSTEM(wide_get_full_path_name, GetFullPathNameW, 16);
+
+/// Makes a folder.
+extern "C" BOOL WINAPI wide_create_directory(
+    LPCWSTR name, LPSECURITY_ATTRIBUTES attributes
+) __asm__(OA_XP_SYSTEM_SYMBOL(CreateDirectoryW, 8));
+
+BOOL WINAPI wide_create_directory(LPCWSTR name, LPSECURITY_ATTRIBUTES attributes) {
+    if (const auto system = system_wide_create_directory.get())
+        return system(name, attributes);
+    char narrow[MAX_PATH + 1]{};
+    if (!narrow_path(name, narrow, sizeof(narrow))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return CreateDirectoryA(narrow, attributes);
+}
+
+OA_XP_DEFINE_SYSTEM(wide_create_directory, CreateDirectoryW, 8);
+
+/// Makes a folder the current one.
+extern "C" BOOL WINAPI wide_set_current_directory(LPCWSTR name) __asm__(
+    OA_XP_SYSTEM_SYMBOL(SetCurrentDirectoryW, 4)
+);
+
+BOOL WINAPI wide_set_current_directory(LPCWSTR name) {
+    if (const auto system = system_wide_set_current_directory.get())
+        return system(name);
+    char narrow[MAX_PATH + 1]{};
+    if (!narrow_path(name, narrow, sizeof(narrow))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return SetCurrentDirectoryA(narrow);
+}
+
+OA_XP_DEFINE_SYSTEM(wide_set_current_directory, SetCurrentDirectoryW, 4);
+
+/// Moves a file or a folder.
+extern "C" BOOL WINAPI wide_move_file(LPCWSTR from, LPCWSTR to) __asm__(
+    OA_XP_SYSTEM_SYMBOL(MoveFileW, 8)
+);
+
+BOOL WINAPI wide_move_file(LPCWSTR from, LPCWSTR to) {
+    if (const auto system = system_wide_move_file.get())
+        return system(from, to);
+    char narrow_from[MAX_PATH + 1]{};
+    char narrow_to[MAX_PATH + 1]{};
+    if (!narrow_path(from, narrow_from, sizeof(narrow_from)) ||
+        !narrow_path(to, narrow_to, sizeof(narrow_to))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return MoveFileA(narrow_from, narrow_to);
+}
+
+OA_XP_DEFINE_SYSTEM(wide_move_file, MoveFileW, 8);
+
+/// Removes a file.
+extern "C" BOOL WINAPI wide_delete_file(LPCWSTR name) __asm__(
+    OA_XP_SYSTEM_SYMBOL(DeleteFileW, 4)
+);
+
+BOOL WINAPI wide_delete_file(LPCWSTR name) {
+    if (const auto system = system_wide_delete_file.get())
+        return system(name);
+    char narrow[MAX_PATH + 1]{};
+    if (!narrow_path(name, narrow, sizeof(narrow))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return DeleteFileA(narrow);
+}
+
+OA_XP_DEFINE_SYSTEM(wide_delete_file, DeleteFileW, 4);
+
+/// Copies a file.
+extern "C" BOOL WINAPI wide_copy_file(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) __asm__(
+    OA_XP_SYSTEM_SYMBOL(CopyFileW, 12)
+);
+
+BOOL WINAPI wide_copy_file(LPCWSTR from, LPCWSTR to, BOOL fail_if_exists) {
+    if (const auto system = system_wide_copy_file.get())
+        return system(from, to, fail_if_exists);
+    char narrow_from[MAX_PATH + 1]{};
+    char narrow_to[MAX_PATH + 1]{};
+    if (!narrow_path(from, narrow_from, sizeof(narrow_from)) ||
+        !narrow_path(to, narrow_to, sizeof(narrow_to))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return CopyFileA(narrow_from, narrow_to, fail_if_exists);
+}
+
+OA_XP_DEFINE_SYSTEM(wide_copy_file, CopyFileW, 12);
+
+/// Reads the whole environment.
+///
+/// SDL builds its own table of the environment from this call and answers every
+/// hint out of that table, so a wide stub here tells a program that it has no
+/// environment at all and hides every variable set for it. That is what kept
+/// `SDL_AUDIO_DRIVER=dummy` from being seen, and left SDL choosing a sound
+/// driver this machine has not got before it ever reached the video it was
+/// asked for. The block is the one the narrow call answers with, widened, and
+/// it is freed by the call below.
+///
+/// @return the block, or null when the environment cannot be read
+/// @see wide_free_environment_strings
+
+extern "C" LPWSTR WINAPI wide_get_environment_strings() __asm__(
+    OA_XP_SYSTEM_SYMBOL(GetEnvironmentStringsW, 0)
+);
+
+/// The blocks this hands out, so the call that frees one can tell them from the
+/// system's.
+wchar_t* environment_blocks[8] = {};
+
+LPWSTR WINAPI wide_get_environment_strings() {
+    if (const auto system = system_wide_get_environment_strings.get())
+        return system();
+
+    char* narrow = GetEnvironmentStringsA();
+    if (narrow == nullptr)
+        return nullptr;
+
+    // A run of null-terminated strings, ending at an empty one, and the empty
+    // one that ends the copy as well.
+    int characters = 1;
+    for (const char* entry = narrow; *entry != '\0'; entry += std::strlen(entry) + 1) {
+        characters += static_cast<int>(MultiByteToWideChar(CP_ACP, 0, entry, -1, nullptr, 0));
+    }
+
+    auto* wide = static_cast<wchar_t*>(LocalAlloc(LMEM_FIXED, characters * sizeof(wchar_t)));
+    if (wide == nullptr) {
+        FreeEnvironmentStringsA(narrow);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+
+    wchar_t* write = wide;
+    for (const char* entry = narrow; *entry != '\0'; entry += std::strlen(entry) + 1) {
+        const int written = MultiByteToWideChar(
+            CP_ACP, 0, entry, -1, write, characters - static_cast<int>(write - wide)
+        );
+        if (written == 0)
+            break;
+        write += written;
+    }
+    *write = L'\0';
+    FreeEnvironmentStringsA(narrow);
+
+    for (wchar_t*& kept : environment_blocks) {
+        if (kept == nullptr) {
+            kept = wide;
+            break;
+        }
+    }
+    return wide;
+}
+
+OA_XP_DEFINE_SYSTEM(wide_get_environment_strings, GetEnvironmentStringsW, 0);
+
+/// Frees the block the call above answered with.
+///
+/// @param block the block
+/// @return true, as the call this stands for does
+
+extern "C" BOOL WINAPI wide_free_environment_strings(LPWSTR block) __asm__(
+    OA_XP_SYSTEM_SYMBOL(FreeEnvironmentStringsW, 4)
+);
+
+BOOL WINAPI wide_free_environment_strings(LPWSTR block) {
+    if (const auto system = system_wide_free_environment_strings.get())
+        return system(block);
+    if (block == nullptr)
+        return FALSE;
+    for (wchar_t*& kept : environment_blocks) {
+        if (kept == block) {
+            kept = nullptr;
+            LocalFree(block);
+            return TRUE;
+        }
+    }
+    // Not one of ours; there is nothing of the system's here to free.
+    return TRUE;
+}
+
+OA_XP_DEFINE_SYSTEM(wide_free_environment_strings, FreeEnvironmentStringsW, 4);
+
+/// Writes a line to whatever is listening for debug output.
+///
+/// SDL sends every message it logs through this, so a stub here is a program
+/// that says nothing at all about what it is doing or why it stopped -- which
+/// is how the whole of this port came to be full of silent failures. The line
+/// is narrowed and written with the narrow call.
+///
+/// @param text the line to write
+extern "C" void WINAPI output_debug_string(LPCWSTR text) __asm__(
+    OA_XP_SYSTEM_SYMBOL(OutputDebugStringW, 4)
+);
+
+void WINAPI output_debug_string(LPCWSTR text) {
+    if (const auto system = system_output_debug_string.get()) {
+        system(text);
+        return;
+    }
+    char narrow[1024]{};
+    if (!narrow_path(text, narrow, sizeof(narrow)))
+        return;
+    OutputDebugStringA(narrow);
+}
+
+OA_XP_DEFINE_SYSTEM(output_debug_string, OutputDebugStringW, 4);
+
+
+
 /// Reads a file's size, which Windows 95 answers in two halves.
 ///
 /// @param file the file to read
@@ -511,6 +958,12 @@ BOOL WINAPI get_file_size_ex(HANDLE file, PLARGE_INTEGER size) {
         return FALSE;
     }
     DWORD high = 0;
+    // GetFileSize answers failure with a sentinel *together with* the last
+    // error, and Microsoft's documentation requires the error to be cleared
+    // first: otherwise an error an earlier call left behind makes a good file
+    // look like a failed one. On Windows 95 that value is arbitrary, so this is
+    // the difference between reading an archive and reporting it missing.
+    SetLastError(ERROR_SUCCESS);
     const DWORD low = GetFileSize(file, &high);
     if (low == INVALID_FILE_SIZE && GetLastError() != NO_ERROR)
         return FALSE;
@@ -720,6 +1173,9 @@ BOOL WINAPI set_file_pointer_ex(
     if (const auto system = system_set_file_pointer_ex.get())
         return system(file, distance, position, method);
     LARGE_INTEGER moved{};
+    // The same clearing, for the same reason, before the call that answers
+    // failure with a sentinel and the last error.
+    SetLastError(ERROR_SUCCESS);
     moved.LowPart = SetFilePointer(file, distance.LowPart, &distance.HighPart, method);
     if (moved.LowPart == INVALID_SET_FILE_POINTER && GetLastError() != NO_ERROR)
         return FALSE;
@@ -830,9 +1286,12 @@ BOOL WINAPI verify_version_info_w(LPOSVERSIONINFOEXW wanted, DWORD type, DWORDLO
         SetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    OSVERSIONINFOEXW running{};
+    // GetVersionExA: the narrow form is the one Windows 95 has, and the fields
+    // compared here are numbers, so the version description's own strings — the
+    // service pack name — are never read.
+    OSVERSIONINFOEXA running{};
     running.dwOSVersionInfoSize = sizeof(running);
-    if (GetVersionExW(reinterpret_cast<LPOSVERSIONINFOW>(&running)) == FALSE)
+    if (GetVersionExA(reinterpret_cast<LPOSVERSIONINFOA>(&running)) == FALSE)
         return FALSE;
     for (std::size_t field = 0; field < std::size(version_fields); ++field) {
         if ((type & version_fields[field]) == 0)
@@ -849,3 +1308,381 @@ BOOL WINAPI verify_version_info_w(LPOSVERSIONINFOEXW wanted, DWORD type, DWORDLO
 }
 
 OA_XP_DEFINE_SYSTEM(verify_version_info_w, VerifyVersionInfoW, 16);
+
+// Windows 95 cannot open a directory with CreateFile: the call fails with
+// ERROR_ACCESS_DENIED, because opening one is a capability Windows NT has and
+// 95 has not, and FILE_FLAG_BACKUP_SEMANTICS is ignored there. mingw's
+// std::filesystem stats a directory by opening it, so on this Windows
+// fs::is_directory answers false for every directory that is there, and a
+// program pointed at one concludes it does not exist.
+//
+// Opening a directory is answered here with a handle of this file's own.
+// GetFileInformationByHandle fills it in from the folder's attributes, which
+// is the field is_directory reads, and CloseHandle forgets it. Nothing else
+// is done with the folder, which is all a caller that only asks about one
+// does with it.
+
+namespace {
+
+/// Whether the path names a directory that is there.
+bool names_a_directory(const char* narrow) noexcept {
+    const DWORD attributes = GetFileAttributesA(narrow);
+    return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+/// A handle standing for an opened directory, and where it was.
+struct DirectoryHandle {
+    volatile LONG taken; ///< non-zero while this entry stands for one
+    char path[MAX_PATH]; ///< the directory it was opened for
+};
+
+constexpr std::size_t directory_handle_count = 8;
+constexpr uintptr_t directory_handle_base = 0x7f000000u;
+
+DirectoryHandle directory_handles[directory_handle_count];
+
+/// The handle value for an entry. Above every value the system gives out, so
+/// no real handle can be mistaken for one.
+void* directory_handle_for(std::size_t index) noexcept {
+    return reinterpret_cast<void*>(directory_handle_base + index + 1);
+}
+
+/// The entry a handle names, or null when the handle is the system's.
+DirectoryHandle* directory_handle_entry(void* handle) noexcept {
+    const uintptr_t value = reinterpret_cast<uintptr_t>(handle);
+    if (value <= directory_handle_base || value > directory_handle_base + directory_handle_count)
+        return nullptr;
+    DirectoryHandle& entry = directory_handles[value - directory_handle_base - 1];
+    return entry.taken != 0 ? &entry : nullptr;
+}
+
+/// Opens a directory without the system, or returns null when it will not.
+void* open_directory(const char* path) noexcept {
+    for (std::size_t index = 0; index < directory_handle_count; ++index) {
+        DirectoryHandle& entry = directory_handles[index];
+        if (InterlockedCompareExchange(&entry.taken, 1, 0) != 0)
+            continue;
+        std::strncpy(entry.path, path, MAX_PATH - 1);
+        entry.path[MAX_PATH - 1] = '\0';
+        return directory_handle_for(index);
+    }
+    return nullptr;
+}
+
+/// A call of kernel32's, reached through the module handle in the system's own
+/// character set. The SystemFunction lookups above go through
+/// GetModuleHandleW, a stubbed wide call here, so they answer nothing on this
+/// Windows and every stand-in below has to find the system's call itself.
+void* kernel32_call(const char* name) noexcept {
+    const HMODULE module = GetModuleHandleA("kernel32.dll");
+    if (module == nullptr)
+        return nullptr;
+    return reinterpret_cast<void*>(GetProcAddress(module, name));
+}
+
+} // namespace
+
+extern "C" HANDLE WINAPI create_file_a(
+    LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes, DWORD disposition,
+    DWORD flags, HANDLE template_file
+) __asm__(OA_XP_SYSTEM_SYMBOL(CreateFileA, 28));
+
+/// Opens a file, or a directory where the system cannot open one.
+HANDLE WINAPI create_file_a(
+    LPCSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes, DWORD disposition,
+    DWORD flags, HANDLE template_file
+) {
+    using Function =
+        HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+    static const auto system = reinterpret_cast<Function>(kernel32_call("CreateFileA"));
+    if (name != nullptr && disposition == OPEN_EXISTING && names_a_directory(name)) {
+        if (void* handle = open_directory(name))
+            return static_cast<HANDLE>(handle);
+    }
+    if (system == nullptr) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return INVALID_HANDLE_VALUE;
+    }
+    return system(name, access, share, attributes, disposition, flags, template_file);
+}
+
+OA_XP_DEFINE_SYSTEM(create_file_a, CreateFileA, 28);
+
+extern "C" BOOL WINAPI get_file_information_by_handle(
+    HANDLE file, LPBY_HANDLE_FILE_INFORMATION information
+) __asm__(OA_XP_SYSTEM_SYMBOL(GetFileInformationByHandle, 8));
+
+/// Reads what is known about a directory opened the way create_file_a opens
+/// one, or asks the system about any other file.
+BOOL WINAPI get_file_information_by_handle(HANDLE file, LPBY_HANDLE_FILE_INFORMATION information) {
+    using Function = BOOL(WINAPI*)(HANDLE, LPBY_HANDLE_FILE_INFORMATION);
+    static const auto system = reinterpret_cast<Function>(kernel32_call("GetFileInformationByHandle"));
+    DirectoryHandle* const entry = directory_handle_entry(file);
+    if (entry == nullptr) {
+        if (system == nullptr) {
+            SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+            return FALSE;
+        }
+        return system(file, information);
+    }
+    if (information == nullptr) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    WIN32_FIND_DATAA found{};
+    const HANDLE search = FindFirstFileA(entry->path, &found);
+    if (search == INVALID_HANDLE_VALUE) {
+        const DWORD attributes = GetFileAttributesA(entry->path);
+        if (attributes == INVALID_FILE_ATTRIBUTES)
+            return FALSE;
+        *information = BY_HANDLE_FILE_INFORMATION{};
+        information->dwFileAttributes = attributes;
+        return TRUE;
+    }
+    FindClose(search);
+    *information = BY_HANDLE_FILE_INFORMATION{};
+    information->dwFileAttributes = found.dwFileAttributes;
+    information->ftCreationTime = found.ftCreationTime;
+    information->ftLastAccessTime = found.ftLastAccessTime;
+    information->ftLastWriteTime = found.ftLastWriteTime;
+    information->nFileSizeHigh = found.nFileSizeHigh;
+    information->nFileSizeLow = found.nFileSizeLow;
+    return TRUE;
+}
+
+OA_XP_DEFINE_SYSTEM(get_file_information_by_handle, GetFileInformationByHandle, 8);
+
+extern "C" BOOL WINAPI close_handle(HANDLE object) __asm__(OA_XP_SYSTEM_SYMBOL(CloseHandle, 4));
+
+/// Closes a handle, forgetting one of this file's own.
+BOOL WINAPI close_handle(HANDLE object) {
+    using Function = BOOL(WINAPI*)(HANDLE);
+    static const auto system = reinterpret_cast<Function>(kernel32_call("CloseHandle"));
+    if (DirectoryHandle* const entry = directory_handle_entry(object)) {
+        entry->path[0] = '\0';
+        InterlockedExchange(&entry->taken, 0);
+        return TRUE;
+    }
+    if (system == nullptr) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+    return system(object);
+}
+
+OA_XP_DEFINE_SYSTEM(close_handle, CloseHandle, 4);
+
+// The same for the wide call, which is the one the C++ run-time library's
+// filesystem uses: it converts nothing itself, so a program that stats a
+// folder goes through this name.
+extern "C" HANDLE WINAPI create_file_w(
+    LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes, DWORD disposition,
+    DWORD flags, HANDLE template_file
+) __asm__(OA_XP_SYSTEM_SYMBOL(CreateFileW, 28));
+
+/// Opens a file, or a directory where the system cannot open one.
+///
+/// This Windows answers the wide call with nothing: measured on the guest, it
+/// returns NULL and leaves ERROR_CALL_NOT_IMPLEMENTED, and makes no file. NULL
+/// is not the failure a caller is given to expect, which is
+/// INVALID_HANDLE_VALUE, so a caller that checks for that one — as
+/// preferences::save does — walks on holding a null handle and reports a later
+/// step going wrong instead of this one.
+///
+/// So the path is read in the system's own character set and the narrow call is
+/// made in its place, as every stand-in in this file does.
+HANDLE WINAPI create_file_w(
+    LPCWSTR name, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES attributes, DWORD disposition,
+    DWORD flags, HANDLE template_file
+) {
+    char narrow[MAX_PATH + 1] = {};
+    if (!narrow_path(name, narrow, sizeof(narrow))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    return create_file_a(narrow, access, share, attributes, disposition, flags, template_file);
+}
+
+OA_XP_DEFINE_SYSTEM(create_file_w, CreateFileW, 28);
+
+// MoveFileEx is not on this Windows either: measured on the guest, both forms
+// answer with nothing (ERROR_CALL_NOT_IMPLEMENTED from each) while the plain
+// MoveFile works. The behaviour it promises is therefore built here out of the
+// calls that are there.
+//
+// MOVEFILE_REPLACE_EXISTING is the flag that matters and the one that must not
+// be faked. MoveFile will not write over a file that is there — measured,
+// ERROR_ALREADY_EXISTS, 183 — so the file that is there is removed first, and
+// when that cannot be done the failure is reported rather than the move being
+// allowed to appear to have worked and lose what was there.
+//
+// MOVEFILE_WRITE_THROUGH is not honoured: the old file is gone and the new one
+// is in its place before this returns, but nothing here can promise more than
+// the write that has already been done to the file. MOVEFILE_DELAY_UNTIL_REBOOT
+// is refused outright, because the entry it needs cannot be written from here
+// and doing the move now would be a different thing from what was asked for.
+
+extern "C" BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) __asm__(
+    OA_XP_SYSTEM_SYMBOL(MoveFileExW, 12)
+);
+
+BOOL WINAPI move_file_ex_w(LPCWSTR from, LPCWSTR to, DWORD flags) {
+    char source[MAX_PATH + 1] = {};
+    char destination[MAX_PATH + 1] = {};
+    if (!narrow_path(from, source, sizeof(source)) ||
+        !narrow_path(to, destination, sizeof(destination))) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if ((flags & MOVEFILE_DELAY_UNTIL_REBOOT) != 0) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+    const bool replace = (flags & MOVEFILE_REPLACE_EXISTING) != 0;
+    if (replace) {
+        SetLastError(ERROR_SUCCESS);
+        if (!DeleteFileA(destination)) {
+            // A destination that is not there is what a save normally has.
+            const DWORD error = GetLastError();
+            if (error != ERROR_SUCCESS && error != ERROR_FILE_NOT_FOUND &&
+                error != ERROR_PATH_NOT_FOUND)
+                return FALSE;
+        }
+    }
+    if (MoveFileA(source, destination))
+        return TRUE;
+    const DWORD moved_error = GetLastError();
+    // A move between two volumes is what COPY_ALLOWED is for, and a copy with
+    // the original removed leaves the same thing behind.
+    if ((flags & MOVEFILE_COPY_ALLOWED) != 0) {
+        SetLastError(ERROR_SUCCESS);
+        if (CopyFileA(source, destination, replace ? FALSE : TRUE) && DeleteFileA(source))
+            return TRUE;
+    }
+    SetLastError(moved_error);
+    return FALSE;
+}
+
+OA_XP_DEFINE_SYSTEM(move_file_ex_w, MoveFileExW, 12);
+
+// The wide semaphore and event, which this Windows answers with nothing as it
+// does the other wide calls. SDL makes one of each to start its video, so
+// without these a program cannot open a window at all: the start stops with
+// "Couldn't create semaphore" and no frame is ever shown.
+
+using WideCreateSemaphoreFunction = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, LONG, LONG, LPCWSTR);
+using WideCreateEventFunction = HANDLE(WINAPI*)(LPSECURITY_ATTRIBUTES, BOOL, BOOL, LPCWSTR);
+constinit SystemFunction<WideCreateSemaphoreFunction> system_wide_create_semaphore{
+    kernel32, "CreateSemaphoreW"
+};
+constinit SystemFunction<WideCreateEventFunction> system_wide_create_event{
+    kernel32, "CreateEventW"
+};
+
+extern "C" HANDLE WINAPI create_semaphore_w(
+    LPSECURITY_ATTRIBUTES attributes, LONG initial, LONG maximum, LPCWSTR name
+) __asm__(OA_XP_SYSTEM_SYMBOL(CreateSemaphoreW, 16));
+
+/// Creates a semaphore, as CreateSemaphoreW does, through the narrow call this
+/// Windows does answer.
+///
+/// The name is the only part of the call that a character set belongs to, so
+/// it is narrowed and the rest is passed on unchanged. A null name — an
+/// unnamed semaphore — stays null.
+///
+/// @param attributes the security attributes, or null for the default ones
+/// @param initial the count the semaphore starts with
+/// @param maximum the largest count it may reach
+/// @param name the name to create it under, or null for an unnamed semaphore
+/// @return the semaphore, or null with the error set as the narrow call sets it
+HANDLE WINAPI create_semaphore_w(
+    LPSECURITY_ATTRIBUTES attributes, LONG initial, LONG maximum, LPCWSTR name
+) {
+    if (const auto system = system_wide_create_semaphore.get())
+        return system(attributes, initial, maximum, name);
+    char narrow[MAX_PATH + 1]{};
+    const char* named = nullptr;
+    if (name != nullptr) {
+        if (WideCharToMultiByte(CP_ACP, 0, name, -1, narrow, sizeof(narrow), nullptr, nullptr) == 0) {
+            SetLastError(ERROR_INVALID_NAME);
+            return nullptr;
+        }
+        named = narrow;
+    }
+    return CreateSemaphoreA(attributes, initial, maximum, named);
+}
+
+OA_XP_DEFINE_SYSTEM(create_semaphore_w, CreateSemaphoreW, 16);
+
+extern "C" HANDLE WINAPI create_event_w(
+    LPSECURITY_ATTRIBUTES attributes, BOOL manual_reset, BOOL initial, LPCWSTR name
+) __asm__(OA_XP_SYSTEM_SYMBOL(CreateEventW, 16));
+
+/// Creates an event, as CreateEventW does, through the narrow call this
+/// Windows does answer, for the same reason as the semaphore above: SDL makes
+/// one to be woken by, and without it the video start fails.
+///
+/// @param attributes the security attributes, or null for the default ones
+/// @param manual_reset whether the event stays set until it is reset by hand
+/// @param initial whether it starts set
+/// @param name the name to create it under, or null for an unnamed event
+/// @return the event, or null with the error set as the narrow call sets it
+HANDLE WINAPI create_event_w(
+    LPSECURITY_ATTRIBUTES attributes, BOOL manual_reset, BOOL initial, LPCWSTR name
+) {
+    if (const auto system = system_wide_create_event.get())
+        return system(attributes, manual_reset, initial, name);
+    char narrow[MAX_PATH + 1]{};
+    const char* named = nullptr;
+    if (name != nullptr) {
+        if (WideCharToMultiByte(CP_ACP, 0, name, -1, narrow, sizeof(narrow), nullptr, nullptr) == 0) {
+            SetLastError(ERROR_INVALID_NAME);
+            return nullptr;
+        }
+        named = narrow;
+    }
+    return CreateEventA(attributes, manual_reset, initial, named);
+}
+
+OA_XP_DEFINE_SYSTEM(create_event_w, CreateEventW, 16);
+
+/// The code a program raises to hand a debugger the name of the thread raising
+/// it. It is not a fault, and the name it carries is a courtesy to a debugger.
+constexpr DWORD thread_name_exception = 0x406d1388;
+
+extern "C" void WINAPI raise_exception(
+    DWORD code, DWORD flags, DWORD argument_count, const ULONG_PTR* arguments
+) __asm__(OA_XP_SYSTEM_SYMBOL(RaiseException, 16));
+
+/// Raises an exception, as RaiseException does, except for the one a program
+/// raises to name the thread it is running on.
+///
+/// That call is not a fault being reported: it is a program handing a debugger
+/// the name of the thread, which a debugger catches, reads and ignores. SDL
+/// raises it for every thread it names, and installs a vectored handler to
+/// take it back — and a vectored handler is a Windows XP addition this Windows
+/// cannot install, so here the raise is read by no one and the thread dies on
+/// it, before a window can be shown, saying nothing about why. A name meant
+/// for a debugger is nothing a system without one can lose, so this one is
+/// dropped; every other code is raised as before, the C++ run-time library's
+/// own among them.
+///
+/// @param code the exception code
+/// @param flags whether the exception may be continued
+/// @param argument_count how many arguments the exception carries
+/// @param arguments those arguments
+void WINAPI raise_exception(
+    DWORD code, DWORD flags, DWORD argument_count, const ULONG_PTR* arguments
+) {
+    if (code == thread_name_exception)
+        return;
+    using Function = void(WINAPI*)(DWORD, DWORD, DWORD, const ULONG_PTR*);
+    static const auto system = reinterpret_cast<Function>(kernel32_call("RaiseException"));
+    if (system == nullptr) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return;
+    }
+    system(code, flags, argument_count, arguments);
+}
+
+OA_XP_DEFINE_SYSTEM(raise_exception, RaiseException, 16);
